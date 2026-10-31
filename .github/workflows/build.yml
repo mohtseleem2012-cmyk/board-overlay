@@ -1,0 +1,395 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Write project files
+        run: |
+          mkdir -p app/src/main/java/com/example/boardoverlay
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "BoardOverlay"
+          include ':app'
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=false
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+          android {
+              namespace 'com.example.boardoverlay'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'com.example.boardoverlay'
+                  minSdk 21
+                  targetSdk 33
+                  versionCode 1
+                  versionName '1.0'
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_1_8
+                  targetCompatibility JavaVersion.VERSION_1_8
+              }
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <application
+                  android:label="Board Overlay"
+                  android:theme="@android:style/Theme.DeviceDefault.Light">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".OverlayService" android:exported="false" />
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/example/boardoverlay/MainActivity.java <<'EOF'
+          package com.example.boardoverlay;
+
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.provider.Settings;
+          import android.view.View;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          public class MainActivity extends Activity {
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  LinearLayout l = new LinearLayout(this);
+                  l.setOrientation(LinearLayout.VERTICAL);
+                  l.setPadding(40, 40, 40, 40);
+                  TextView t = new TextView(this);
+                  t.setTextSize(18);
+                  t.setText("Board Overlay\n\nTap Start. The first time, allow Display over other apps, then come back and tap Start again.\n\nA toolbar appears on the left. Draw over any app. Tap Touch to use the app underneath, and Draw to write again.");
+                  Button start = new Button(this);
+                  start.setText("Start");
+                  start.setOnClickListener(new View.OnClickListener() {
+                      public void onClick(View v) { startOverlay(); }
+                  });
+                  Button stop = new Button(this);
+                  stop.setText("Stop");
+                  stop.setOnClickListener(new View.OnClickListener() {
+                      public void onClick(View v) { stopService(new Intent(MainActivity.this, OverlayService.class)); }
+                  });
+                  l.addView(t);
+                  l.addView(start);
+                  l.addView(stop);
+                  setContentView(l);
+              }
+
+              private void startOverlay() {
+                  if (Build.VERSION.SDK_INT >= 23 && !Settings.canDrawOverlays(this)) {
+                      Toast.makeText(this, "Allow Display over other apps, then come back", Toast.LENGTH_LONG).show();
+                      startActivity(new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + getPackageName())));
+                      return;
+                  }
+                  Intent i = new Intent(this, OverlayService.class);
+                  if (Build.VERSION.SDK_INT >= 26) startForegroundService(i); else startService(i);
+                  moveTaskToBack(true);
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/example/boardoverlay/DrawView.java <<'EOF'
+          package com.example.boardoverlay;
+
+          import android.content.Context;
+          import android.graphics.Canvas;
+          import android.graphics.Color;
+          import android.graphics.Paint;
+          import android.graphics.Path;
+          import android.graphics.PorterDuff;
+          import android.graphics.PorterDuffXfermode;
+          import android.view.MotionEvent;
+          import android.view.View;
+          import java.util.ArrayList;
+
+          public class DrawView extends View {
+              static class Stroke {
+                  Path path = new Path();
+                  Paint paint;
+              }
+
+              private final ArrayList<Stroke> strokes = new ArrayList<Stroke>();
+              private Stroke cur;
+              private int color = Color.RED;
+              private int tool = 0; // 0 pen, 1 marker, 2 eraser
+
+              public DrawView(Context c) {
+                  super(c);
+                  setLayerType(View.LAYER_TYPE_HARDWARE, null);
+              }
+
+              public void setTool(int t) { tool = t; }
+              public void setColor(int c) { color = c; if (tool == 2) tool = 0; }
+              public void undo() { if (!strokes.isEmpty()) { strokes.remove(strokes.size() - 1); invalidate(); } }
+              public void clear() { strokes.clear(); invalidate(); }
+
+              private Paint makePaint() {
+                  Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  p.setStyle(Paint.Style.STROKE);
+                  p.setStrokeCap(Paint.Cap.ROUND);
+                  p.setStrokeJoin(Paint.Join.ROUND);
+                  if (tool == 0) {
+                      p.setColor(color);
+                      p.setStrokeWidth(6);
+                  } else if (tool == 1) {
+                      p.setColor((color & 0x00FFFFFF) | 0x66000000);
+                      p.setStrokeWidth(30);
+                  } else {
+                      p.setColor(Color.TRANSPARENT);
+                      p.setXfermode(new PorterDuffXfermode(PorterDuff.Mode.CLEAR));
+                      p.setStrokeWidth(44);
+                  }
+                  return p;
+              }
+
+              @Override
+              protected void onDraw(Canvas canvas) {
+                  int sc = canvas.saveLayer(null, null);
+                  for (Stroke s : strokes) canvas.drawPath(s.path, s.paint);
+                  canvas.restoreToCount(sc);
+              }
+
+              @Override
+              public boolean onTouchEvent(MotionEvent e) {
+                  float x = e.getX(), y = e.getY();
+                  switch (e.getActionMasked()) {
+                      case MotionEvent.ACTION_DOWN:
+                          cur = new Stroke();
+                          cur.paint = makePaint();
+                          cur.path.moveTo(x, y);
+                          cur.path.lineTo(x + 0.1f, y);
+                          strokes.add(cur);
+                          invalidate();
+                          return true;
+                      case MotionEvent.ACTION_MOVE:
+                          if (cur != null) { cur.path.lineTo(x, y); invalidate(); }
+                          return true;
+                      case MotionEvent.ACTION_UP:
+                      case MotionEvent.ACTION_CANCEL:
+                          cur = null;
+                          return true;
+                  }
+                  return super.onTouchEvent(e);
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/example/boardoverlay/OverlayService.java <<'EOF'
+          package com.example.boardoverlay;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.Service;
+          import android.content.Intent;
+          import android.graphics.Color;
+          import android.graphics.PixelFormat;
+          import android.os.Build;
+          import android.os.IBinder;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.view.WindowManager;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import java.util.ArrayList;
+
+          public class OverlayService extends Service {
+              private WindowManager wm;
+              private DrawView dv;
+              private LinearLayout bar;
+              private WindowManager.LayoutParams dvp;
+              private WindowManager.LayoutParams barp;
+              private Button touchBtn;
+              private boolean touchMode = false;
+              private boolean collapsed = false;
+              private final ArrayList<Button> buttons = new ArrayList<Button>();
+              private final int[] colors = { Color.RED, Color.BLUE, Color.rgb(0, 150, 60), Color.YELLOW, Color.BLACK, Color.WHITE };
+              private int ci = 0;
+
+              @Override
+              public IBinder onBind(Intent i) { return null; }
+
+              @Override
+              public int onStartCommand(Intent i, int f, int s) { return START_STICKY; }
+
+              @Override
+              public void onCreate() {
+                  super.onCreate();
+                  startForeground(1, makeNotification());
+                  wm = (WindowManager) getSystemService(WINDOW_SERVICE);
+                  int type = Build.VERSION.SDK_INT >= 26
+                          ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                          : WindowManager.LayoutParams.TYPE_PHONE;
+
+                  dv = new DrawView(this);
+                  dvp = new WindowManager.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT, type,
+                          WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                                  | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                                  | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                          PixelFormat.TRANSLUCENT);
+                  wm.addView(dv, dvp);
+
+                  bar = new LinearLayout(this);
+                  bar.setOrientation(LinearLayout.VERTICAL);
+                  bar.setBackgroundColor(0xCC2B2E33);
+                  bar.setPadding(dp(4), dp(4), dp(4), dp(4));
+                  barp = new WindowManager.LayoutParams(
+                          ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, type,
+                          WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                          PixelFormat.TRANSLUCENT);
+                  barp.gravity = Gravity.LEFT | Gravity.CENTER_VERTICAL;
+
+                  addMenuButton();
+                  touchBtn = addButton("Touch", new Runnable() { public void run() { toggleTouch(); } });
+                  addButton("Pen", new Runnable() { public void run() { dv.setTool(0); } });
+                  addButton("Marker", new Runnable() { public void run() { dv.setTool(1); } });
+                  addButton("Eraser", new Runnable() { public void run() { dv.setTool(2); } });
+                  final Button colorBtn = addButton("Color", null);
+                  colorBtn.setBackgroundColor(colors[0]);
+                  colorBtn.setOnClickListener(new View.OnClickListener() {
+                      public void onClick(View v) {
+                          ci = (ci + 1) % colors.length;
+                          dv.setColor(colors[ci]);
+                          colorBtn.setBackgroundColor(colors[ci]);
+                          colorBtn.setTextColor(ci == 3 || ci == 5 ? Color.BLACK : Color.WHITE);
+                      }
+                  });
+                  addButton("Undo", new Runnable() { public void run() { dv.undo(); } });
+                  addButton("Clear", new Runnable() { public void run() { dv.clear(); } });
+                  addButton("Exit", new Runnable() { public void run() { stopSelf(); } });
+                  wm.addView(bar, barp);
+              }
+
+              private void addMenuButton() {
+                  Button b = new Button(this);
+                  b.setText("Menu");
+                  b.setTextSize(12);
+                  b.setTextColor(Color.WHITE);
+                  b.setBackgroundColor(0xFF4DA3FF);
+                  b.setOnClickListener(new View.OnClickListener() {
+                      public void onClick(View v) {
+                          collapsed = !collapsed;
+                          for (Button x : buttons) x.setVisibility(collapsed ? View.GONE : View.VISIBLE);
+                      }
+                  });
+                  bar.addView(b, buttonParams());
+              }
+
+              private Button addButton(String label, final Runnable action) {
+                  Button b = new Button(this);
+                  b.setText(label);
+                  b.setTextSize(12);
+                  b.setTextColor(Color.WHITE);
+                  b.setBackgroundColor(0xFF555A61);
+                  if (action != null) {
+                      b.setOnClickListener(new View.OnClickListener() {
+                          public void onClick(View v) { action.run(); }
+                      });
+                  }
+                  buttons.add(b);
+                  bar.addView(b, buttonParams());
+                  return b;
+              }
+
+              private LinearLayout.LayoutParams buttonParams() {
+                  LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(dp(72), dp(44));
+                  p.setMargins(0, dp(2), 0, dp(2));
+                  return p;
+              }
+
+              private void toggleTouch() {
+                  touchMode = !touchMode;
+                  if (touchMode) dvp.flags |= WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
+                  else dvp.flags &= ~WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
+                  wm.updateViewLayout(dv, dvp);
+                  touchBtn.setText(touchMode ? "Draw" : "Touch");
+              }
+
+              private int dp(int v) {
+                  return (int) (v * getResources().getDisplayMetrics().density);
+              }
+
+              private Notification makeNotification() {
+                  Notification.Builder b;
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+                      nm.createNotificationChannel(new NotificationChannel("board", "Board overlay", NotificationManager.IMPORTANCE_LOW));
+                      b = new Notification.Builder(this, "board");
+                  } else {
+                      b = new Notification.Builder(this);
+                  }
+                  b.setContentTitle("Board overlay is on");
+                  b.setContentText("Use Exit in the toolbar to close it");
+                  b.setSmallIcon(android.R.drawable.ic_menu_edit);
+                  return b.build();
+              }
+
+              @Override
+              public void onDestroy() {
+                  try { wm.removeView(bar); } catch (Exception e) { }
+                  try { wm.removeView(dv); } catch (Exception e) { }
+                  super.onDestroy();
+              }
+          }
+          EOF
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: board-overlay-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
